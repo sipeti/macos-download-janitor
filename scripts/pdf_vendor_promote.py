@@ -7,7 +7,11 @@ import unicodedata
 from pathlib import Path
 
 from downloads_organizer import DEFAULT_ROOT
-from vendor_rules import load_local_vendor_rules, save_local_vendor_rules
+from vendor_rules import (
+    load_local_vendor_rules,
+    save_local_vendor_rules,
+    validate_learned_vendor_name,
+)
 
 
 def accentfold(value):
@@ -51,6 +55,7 @@ def load_candidates(path, include_medium=False):
         raise SystemExit(f"Missing discovery report: {path}\nRun the matching ./janitor pdf vendors command first.")
 
     selected = []
+    rejected = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             confidence = (row.get("confidence") or "").strip().lower()
@@ -76,6 +81,12 @@ def load_candidates(path, include_medium=False):
             name = (row.get("candidate") or "").strip()
             if not name:
                 continue
+
+            valid, reason = validate_learned_vendor_name(name)
+            if not valid:
+                rejected.append((name, reason))
+                continue
+
             hosts = [h.strip() for h in (row.get("source_hosts") or "").split("|") if h.strip()]
             selected.append({
                 "name": name,
@@ -87,7 +98,7 @@ def load_candidates(path, include_medium=False):
             })
 
     selected.sort(key=lambda r: (-r["documents"], r["name"].lower()))
-    return selected
+    return selected, rejected
 
 
 def main():
@@ -102,7 +113,7 @@ def main():
     root = Path(ns.root).expanduser().resolve()
     suffix = "_managed" if ns.scope == "managed" else ""
     report = root / "_Janitor" / "reports" / f"pdf_vendor_candidates{suffix}.csv"
-    selected = load_candidates(report, include_medium=ns.include_medium)
+    selected, rejected = load_candidates(report, include_medium=ns.include_medium)
     existing = {name.lower() for name, _ in load_local_vendor_rules(root)}
     new_rules = [r for r in selected if r["name"].lower() not in existing]
 
@@ -111,6 +122,7 @@ def main():
     print(f"Scope:               {ns.scope}")
     print(f"Discovery report:    {report}")
     print(f"Eligible candidates: {len(selected)}")
+    print(f"Rejected as implausible: {len(rejected)}")
     print(f"Already local:       {len(selected) - len(new_rules)}")
     print(f"New private rules:   {len(new_rules)}")
 
@@ -119,6 +131,13 @@ def main():
             f"  {row['name']}  docs={row['documents']} seller={row['seller_hits']} "
             f"source={row['source_hits']} confidence={row['confidence']}"
         )
+
+    if rejected:
+        print("\nRejected candidate names:")
+        for name, reason in rejected[:20]:
+            print(f"  {reason:<34} {name}")
+        if len(rejected) > 20:
+            print(f"  ... and {len(rejected) - 20} more")
 
     if not ns.apply:
         print("\nDRY RUN ONLY. Nothing was written.")
@@ -142,6 +161,7 @@ def main():
     )
     print(f"\nInstalled {len(new_rules)} private local vendor rules.")
     print(f"Local config: {path}")
+    print("Previously learned malformed rules are ignored by the loader and are dropped when this config is rewritten.")
     print("This file is under _Janitor and is not intended for GitHub.")
 
 

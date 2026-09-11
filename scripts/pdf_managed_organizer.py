@@ -22,7 +22,11 @@ from downloads_organizer import (
     sensitive_reason,
     where_froms,
 )
-from vendor_rules import all_vendor_rules, load_local_vendor_rules
+from vendor_rules import (
+    all_vendor_rules,
+    load_local_vendor_rules,
+    load_local_vendor_rules_with_rejections,
+)
 
 
 def iter_managed_pdfs(root):
@@ -33,6 +37,55 @@ def iter_managed_pdfs(root):
         p for p in managed.rglob("*.pdf")
         if p.is_file() and not p.name.startswith(".")
     )
+
+
+def semantic_evidence_is_strong(reason, kind):
+    """Recognize the same semantic strength that produced a medium PDF score.
+
+    A known vendor plus either two kind markers or one long/specific marker is strong
+    enough for managed-tree reclassification. Vendor recognition alone is not enough.
+    """
+    prefix = f"{kind}: "
+    for part in reason.split("; "):
+        if not part.startswith(prefix):
+            continue
+        hits = [hit.strip() for hit in part[len(prefix):].split(",") if hit.strip()]
+        if len(hits) >= 2:
+            return True
+        if any(len(hit) > 10 for hit in hits):
+            return True
+    return False
+
+
+def managed_decision(path, root, kind, vendor, confidence, reason, dest_dir, text_backend):
+    """Return (action, desired_parent, effective_confidence, reason)."""
+    effective_confidence = confidence
+    effective_reason = reason
+
+    # The generic inbox classifier deliberately keeps this combination at medium.
+    # Inside the explicitly selected managed PDF tree we can be slightly more useful:
+    # if a reviewed vendor rule matches AND the document also has strong semantic kind
+    # evidence, promote it to a safe semantic move.
+    if (
+        confidence == "medium"
+        and vendor != "Unknown"
+        and kind != "Other"
+        and text_backend != "none"
+        and semantic_evidence_is_strong(reason, kind)
+    ):
+        effective_confidence = "high+vendor-kind"
+        dest_dir = Path("_PDF") / kind / vendor
+        effective_reason = f"{reason}; promoted:known-vendor+strong-kind"
+
+    desired_parent = root / dest_dir
+    if path.parent.resolve() == desired_parent.resolve():
+        action = "LEAVE"
+    elif effective_confidence.startswith("high"):
+        action = "MOVE"
+    else:
+        action = "REVIEW"
+
+    return action, desired_parent, effective_confidence, effective_reason
 
 
 def scan(root):
@@ -66,15 +119,10 @@ def scan(root):
             continue
 
         kind, vendor, confidence, reason, dest_dir, text_backend = classify_pdf(path, origins, vendor_rules)
-        desired_parent = root / dest_dir
+        action, desired_parent, confidence, reason = managed_decision(
+            path, root, kind, vendor, confidence, reason, dest_dir, text_backend
+        )
         desired = desired_parent / path.name
-
-        if path.parent.resolve() == desired_parent.resolve():
-            action = "LEAVE"
-        elif confidence == "high":
-            action = "MOVE"
-        else:
-            action = "REVIEW"
 
         rows.append({
             "path": str(rel),
@@ -114,6 +162,8 @@ def print_summary(rows, root, report):
             destinations[folder][0] += 1
             destinations[folder][1] += int(row["size_bytes"])
 
+    active_rules, rejected_rules = load_local_vendor_rules_with_rejections(root)
+
     print("\nPDF MANAGED TREE AUDIT")
     print("=" * 78)
     print(f"Managed tree:        {root / '_PDF'}")
@@ -123,8 +173,11 @@ def print_summary(rows, root, report):
     print(f"Safe reclassify:     {counts['MOVE']} ({human_size(bytes_by_action['MOVE'])})")
     print(f"Review candidates:   {counts['REVIEW']} ({human_size(bytes_by_action['REVIEW'])})")
     print(f"Sensitive blocked:   {counts['SENSITIVE']}")
-    print(f"Local vendor rules:  {len(load_local_vendor_rules(root))}")
+    print(f"Local vendor rules:  {len(active_rules)} active, {len(rejected_rules)} rejected")
     print(f"Local report:        {report}")
+
+    if rejected_rules:
+        print("WARNING: malformed previously learned vendor rules are being ignored.")
 
     if destinations:
         print("\nDestination summary:")
@@ -184,6 +237,11 @@ def main():
     if ns.include_review:
         moves += [r for r in rows if r["action"] == "REVIEW"]
 
+    if not moves:
+        print("\nNothing eligible to reclassify with the current confidence rules.")
+        print("No PDFs were moved. Review candidates remain untouched.")
+        return
+
     if not ns.yes:
         review_note = " including review staging" if ns.include_review else ""
         answer = input(f"\nReclassify {len(moves)} PDFs inside _PDF{review_note}? [yes/NO] ")
@@ -207,8 +265,6 @@ def main():
         shutil.move(str(src), str(dst))
         moved += 1
 
-    # Remove only directories made empty by our moves, and only under _PDF. Never
-    # remove _PDF itself. This is cosmetic; failures are harmless.
     for directory in sorted((p for p in managed.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
         try:
             directory.rmdir()

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+SCRIPTS = BASE / "scripts"
+
+
+def call_script(name, args):
+    script = SCRIPTS / name
+    if not script.is_file():
+        raise SystemExit(f"Missing helper: {script}")
+    cmd = [sys.executable, str(script), *args]
+    return subprocess.call(cmd)
+
+
+def run_script(name, args):
+    raise SystemExit(call_script(name, args))
+
+
+def passthrough_common(ns):
+    args = []
+    if getattr(ns, "root", None):
+        args += ["--root", ns.root]
+    if getattr(ns, "apply", False):
+        args.append("--apply")
+    if getattr(ns, "yes", False):
+        args.append("--yes")
+    return args
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="janitor",
+        description="Safe, report-first cleanup helpers for macOS Downloads.",
+    )
+    parser.add_argument("--root", default=None, help="Downloads root (default: ~/Downloads)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    scan = sub.add_parser("scan", help="Audit top-level Downloads and show sorting plan")
+    scan.add_argument("--only", choices=["all", "pdf", "zip", "dmg", "media", "gpt", "documents"], default="all")
+
+    organize = sub.add_parser("organize", help="Sort top-level Downloads into managed folders")
+    organize.add_argument("--only", choices=["all", "pdf", "zip", "dmg", "media", "gpt", "documents"], default="all")
+    organize.add_argument("--apply", action="store_true", help="Actually move files")
+    organize.add_argument("--yes", action="store_true", help="Skip confirmation with --apply")
+
+    dup = sub.add_parser("duplicates", help="List duplicate ZIP/DMG archives")
+    dup.add_argument("--kind", choices=["all", "zip", "dmg"], default="all")
+
+    gpt = sub.add_parser("gpt", help="ChatGPT-origin downloads")
+    gpt_sub = gpt.add_subparsers(dest="gpt_command", required=True)
+    gpt_sub.add_parser("scan", help="Inventory ChatGPT-origin files")
+    gpt_org = gpt_sub.add_parser("organize", help="Move ChatGPT-origin files under fromGPT")
+    gpt_org.add_argument("--apply", action="store_true")
+
+    z = sub.add_parser("zip", help="ZIP lifecycle tools")
+    zsub = z.add_subparsers(dest="zip_command", required=True)
+    zsub.add_parser("audit", help="Find ZIPs that appear to be extracted")
+    zsub.add_parser("verify", help="CRC-verify EXACT_EXTRACTED ZIPs")
+    zsub.add_parser("report", help="Run ZIP extraction audit, CRC verification and duplicate audit")
+    zsub.add_parser("duplicates", help="List byte-identical and logical-content duplicate ZIPs")
+    zpair = zsub.add_parser("pair", help="Pair verified ZIPs with extracted copies")
+    zpair.add_argument("--apply", action="store_true")
+
+    d = sub.add_parser("dmg", help="DMG tools")
+    dsub = d.add_subparsers(dest="dmg_command", required=True)
+    dsub.add_parser("audit", help="List DMGs and exact duplicates")
+    dorg = dsub.add_parser("organize", help="Move top-level DMGs into _DMG")
+    dorg.add_argument("--apply", action="store_true")
+    dorg.add_argument("--yes", action="store_true")
+
+    p = sub.add_parser("pdf", help="PDF classification tools")
+    psub = p.add_subparsers(dest="pdf_command", required=True)
+    psub.add_parser("audit", help="Classify top-level PDFs without moving")
+    porg = psub.add_parser("organize", help="Move classified top-level PDFs")
+    porg.add_argument("--apply", action="store_true")
+    porg.add_argument("--yes", action="store_true")
+
+    m = sub.add_parser("media", help="Downloaded media/image source grouping")
+    msub = m.add_subparsers(dest="media_command", required=True)
+    msub.add_parser("audit", help="Group top-level media by source URL without moving")
+    morg = msub.add_parser("organize", help="Move top-level media into source groups")
+    morg.add_argument("--apply", action="store_true")
+    morg.add_argument("--yes", action="store_true")
+
+    ns = parser.parse_args()
+    root_args = ["--root", ns.root] if ns.root else []
+
+    if ns.command == "scan":
+        run_script("downloads_organizer.py", [*root_args, "--only", ns.only])
+    if ns.command == "organize":
+        args = [*root_args, "--only", ns.only]
+        if ns.apply:
+            args.append("--apply")
+        if ns.yes:
+            args.append("--yes")
+        run_script("downloads_organizer.py", args)
+    if ns.command == "duplicates":
+        run_script("archive_duplicates.py", [*root_args, "--kind", ns.kind])
+
+    if ns.command == "gpt":
+        if ns.gpt_command == "scan":
+            run_script("gpt_download_inventory.py", [])
+        args = []
+        if ns.apply:
+            args.append("--apply")
+        run_script("gpt_download_cleanup.py", args)
+
+    if ns.command == "zip":
+        if ns.zip_command == "audit":
+            run_script("zip_extract_audit.py", [])
+        if ns.zip_command == "verify":
+            run_script("zip_crc_verify.py", [])
+        if ns.zip_command == "duplicates":
+            run_script("archive_duplicates.py", [*root_args, "--kind", "zip"])
+        if ns.zip_command == "report":
+            for helper, args0 in (("zip_extract_audit.py", []), ("zip_crc_verify.py", []), ("archive_duplicates.py", [*root_args, "--kind", "zip"])):
+                rc = call_script(helper, args0)
+                if rc:
+                    raise SystemExit(rc)
+            raise SystemExit(0)
+        args = []
+        if ns.apply:
+            args.append("--apply")
+        run_script("janitor_pair_zips.py", args)
+
+    if ns.command == "dmg":
+        if ns.dmg_command == "audit":
+            run_script("archive_duplicates.py", [*root_args, "--kind", "dmg"])
+        args = [*root_args, "--only", "dmg"]
+        if ns.apply:
+            args.append("--apply")
+        if ns.yes:
+            args.append("--yes")
+        run_script("downloads_organizer.py", args)
+
+    if ns.command == "pdf":
+        args = [*root_args, "--only", "pdf"]
+        if ns.pdf_command == "organize" and ns.apply:
+            args.append("--apply")
+        if ns.pdf_command == "organize" and ns.yes:
+            args.append("--yes")
+        run_script("downloads_organizer.py", args)
+
+    if ns.command == "media":
+        args = [*root_args, "--only", "media"]
+        if ns.media_command == "organize" and ns.apply:
+            args.append("--apply")
+        if ns.media_command == "organize" and ns.yes:
+            args.append("--yes")
+        run_script("downloads_organizer.py", args)
+
+
+if __name__ == "__main__":
+    main()

@@ -13,8 +13,7 @@ def call_script(name, args):
     script = SCRIPTS / name
     if not script.is_file():
         raise SystemExit(f"Missing helper: {script}")
-    cmd = [sys.executable, str(script), *args]
-    return subprocess.call(cmd)
+    return subprocess.call([sys.executable, str(script), *args])
 
 
 def run_script(name, args):
@@ -102,12 +101,19 @@ def main():
     porg.add_argument("--include-review", action="store_true", help="Stage lower-confidence PDFs under _PDF/_Review")
     porg.add_argument("--yes", action="store_true")
     add_common_display_args(porg)
+
     pvendors = psub.add_parser("vendors", help="Discover recurring vendor/company names in top-level PDFs")
     pvendors.add_argument("--min-count", type=int, default=2, help="Minimum PDF count for recurring candidates")
     pvendors.add_argument("--verbose", action="store_true", help="Show matching filenames; private")
-    pvendors.add_argument("--emit-rules", action="store_true", help="Generate local draft VENDOR_RULES suggestions")
+    pvendors.add_argument("--show-mentions", action="store_true", help="Also show recurring non-vendor company mentions")
+    pvendors.add_argument("--emit-rules", action="store_true", help="Generate local draft vendor-rule suggestions")
     pvendors.add_argument("--no-pdftotext", action="store_true", help="Disable pdftotext fallback")
     pvendors.add_argument("--no-pdfkit", action="store_true", help="Disable native macOS PDFKit fallback")
+
+    plearn = psub.add_parser("learn", help="Promote discovered vendors into private local rules")
+    plearn.add_argument("--include-medium", action="store_true", help="Also include medium-confidence candidates")
+    plearn.add_argument("--apply", action="store_true", help="Write rules to private local config")
+    plearn.add_argument("--yes", action="store_true", help="Skip confirmation with --apply")
 
     m = sub.add_parser("media", help="Downloaded media/image source grouping")
     msub = m.add_subparsers(dest="media_command", required=True)
@@ -152,9 +158,7 @@ def main():
                 if rc:
                     raise SystemExit(rc)
             raise SystemExit(0)
-        args = []
-        if ns.apply:
-            args.append("--apply")
+        args = ["--apply"] if ns.apply else []
         run_script("janitor_pair_zips.py", args)
 
     if ns.command == "dmg":
@@ -167,6 +171,8 @@ def main():
             args = [*root_args, "--min-count", str(ns.min_count)]
             if ns.verbose:
                 args.append("--verbose")
+            if ns.show_mentions:
+                args.append("--show-mentions")
             if ns.emit_rules:
                 args.append("--emit-rules")
             if ns.no_pdftotext:
@@ -174,6 +180,15 @@ def main():
             if ns.no_pdfkit:
                 args.append("--no-pdfkit")
             run_script("pdf_vendor_discovery.py", args)
+        if ns.pdf_command == "learn":
+            args = [*root_args]
+            if ns.include_medium:
+                args.append("--include-medium")
+            if ns.apply:
+                args.append("--apply")
+            if ns.yes:
+                args.append("--yes")
+            run_script("pdf_vendor_promote.py", args)
         run_script("downloads_organizer.py", organizer_args(ns, "pdf"))
 
     if ns.command == "media":

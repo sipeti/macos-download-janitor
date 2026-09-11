@@ -48,7 +48,7 @@ def company_markers(name, source_hosts):
 
 def load_candidates(path, include_medium=False):
     if not path.is_file():
-        raise SystemExit(f"Missing discovery report: {path}\nRun: ./janitor pdf vendors --emit-rules")
+        raise SystemExit(f"Missing discovery report: {path}\nRun the matching ./janitor pdf vendors command first.")
 
     selected = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -93,23 +93,26 @@ def load_candidates(path, include_medium=False):
 def main():
     ap = argparse.ArgumentParser(description="Promote discovered PDF vendors into a private local rule file.")
     ap.add_argument("--root", default=str(DEFAULT_ROOT))
+    ap.add_argument("--scope", choices=["inbox", "managed"], default="inbox", help="Select which discovery report to learn from")
     ap.add_argument("--include-medium", action="store_true", help="Also include medium-confidence candidates")
     ap.add_argument("--apply", action="store_true", help="Write selected rules into private local config")
     ap.add_argument("--yes", action="store_true", help="Skip confirmation with --apply")
     ns = ap.parse_args()
 
     root = Path(ns.root).expanduser().resolve()
-    report = root / "_Janitor" / "reports" / "pdf_vendor_candidates.csv"
+    suffix = "_managed" if ns.scope == "managed" else ""
+    report = root / "_Janitor" / "reports" / f"pdf_vendor_candidates{suffix}.csv"
     selected = load_candidates(report, include_medium=ns.include_medium)
     existing = {name.lower() for name, _ in load_local_vendor_rules(root)}
     new_rules = [r for r in selected if r["name"].lower() not in existing]
 
     print("\nPDF VENDOR RULE PROMOTION")
     print("=" * 78)
-    print(f"Discovery report:     {report}")
-    print(f"Eligible candidates:  {len(selected)}")
-    print(f"Already local:        {len(selected) - len(new_rules)}")
-    print(f"New private rules:    {len(new_rules)}")
+    print(f"Scope:               {ns.scope}")
+    print(f"Discovery report:    {report}")
+    print(f"Eligible candidates: {len(selected)}")
+    print(f"Already local:       {len(selected) - len(new_rules)}")
+    print(f"New private rules:   {len(new_rules)}")
 
     for row in new_rules:
         print(
@@ -135,7 +138,7 @@ def main():
     path = save_local_vendor_rules(
         root,
         [(r["name"], r["markers"]) for r in new_rules],
-        metadata={"source": "pdf_vendor_candidates.csv", "review_required": True},
+        metadata={"source": report.name, "scope": ns.scope, "review_required": True},
     )
     print(f"\nInstalled {len(new_rules)} private local vendor rules.")
     print(f"Local config: {path}")

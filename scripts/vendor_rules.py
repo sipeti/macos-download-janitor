@@ -8,6 +8,7 @@ written back to the repository.
 """
 
 import json
+import re
 from pathlib import Path
 
 BUILTIN_VENDOR_RULES = [
@@ -29,6 +30,15 @@ BUILTIN_VENDOR_RULES = [
     ("Groupama", ("groupama", "groupama.hu")),
 ]
 
+LEGAL_SUFFIX_RE = re.compile(
+    r"(?:^|\s)(?:Kft\.?|Zrt\.?|Nyrt\.?|Bt\.?|Kkt\.?|Ltd\.?|Limited|GmbH|AG|Inc\.?|LLC|B\.V\.|S\.A\.|SAS|s\.r\.o\.|Sp\.?\s+z\.?\s+o\.?o\.?)\s*$",
+    re.I,
+)
+LEGAL_SUFFIX_ANY_RE = re.compile(
+    r"\b(?:Kft\.?|Zrt\.?|Nyrt\.?|Bt\.?|Kkt\.?|Ltd\.?|Limited|GmbH|AG|Inc\.?|LLC|B\.V\.|S\.A\.|SAS|s\.r\.o\.|Sp\.?\s+z\.?\s+o\.?o\.?)\b",
+    re.I,
+)
+
 
 def local_rules_path(root):
     return Path(root) / "_Janitor" / "config" / "vendor_rules.json"
@@ -37,40 +47,87 @@ def local_rules_path(root):
 def _clean_rule(name, markers):
     name = str(name).strip()
     clean_markers = []
+    seen = set()
     for marker in markers or []:
         marker = str(marker).strip()
-        if marker and marker.lower() not in {m.lower() for m in clean_markers}:
+        key = marker.lower()
+        if marker and key not in seen:
             clean_markers.append(marker)
+            seen.add(key)
     if not name or not clean_markers:
         return None
     return name, tuple(clean_markers)
 
 
-def load_local_vendor_rules(root):
+def validate_learned_vendor_name(name):
+    """Return (is_valid, reason) for a vendor name learned from private PDFs.
+
+    Learned rules are stricter than built-ins because PDF text extraction may turn
+    prose, copyright lines or several adjacent companies into one fake entity.
+    """
+    name = str(name).strip()
+    if not name:
+        return False, "empty-name"
+    if "\n" in name or "\r" in name:
+        return False, "multiline-name"
+    if len(name) > 100:
+        return False, "name-too-long"
+    if name.startswith(("©", "(", "[", "{")):
+        return False, "suspicious-prefix"
+
+    suffixes = LEGAL_SUFFIX_ANY_RE.findall(name)
+    if len(suffixes) != 1:
+        return False, "expected-exactly-one-legal-suffix"
+    if not LEGAL_SUFFIX_RE.search(name):
+        return False, "legal-suffix-not-at-end"
+
+    words = re.findall(r"\S+", name)
+    if len(words) < 2:
+        return False, "too-short"
+    if len(words) > 12:
+        return False, "too-many-words"
+    return True, "ok"
+
+
+def _raw_local_rules(root):
     path = local_rules_path(root)
     if not path.is_file():
         return []
-
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
-
     if isinstance(data, dict):
         data = data.get("rules", [])
-    if not isinstance(data, list):
-        return []
+    return data if isinstance(data, list) else []
 
+
+def load_local_vendor_rules_with_rejections(root):
     rules = []
-    for item in data:
+    rejected = []
+    for item in _raw_local_rules(root):
         if isinstance(item, dict):
             cleaned = _clean_rule(item.get("name", ""), item.get("markers", []))
         elif isinstance(item, (list, tuple)) and len(item) == 2:
             cleaned = _clean_rule(item[0], item[1])
         else:
             cleaned = None
-        if cleaned:
-            rules.append(cleaned)
+
+        if not cleaned:
+            rejected.append(("[invalid rule]", "malformed-rule"))
+            continue
+
+        name, markers = cleaned
+        valid, reason = validate_learned_vendor_name(name)
+        if valid:
+            rules.append((name, markers))
+        else:
+            rejected.append((name, reason))
+    return rules, rejected
+
+
+def load_local_vendor_rules(root):
+    rules, _rejected = load_local_vendor_rules_with_rejections(root)
     return rules
 
 
@@ -87,7 +144,6 @@ def match_vendor(haystack, rules=None):
     for vendor, markers in rules:
         hits = [marker for marker in markers if marker.lower() in h]
         if hits:
-            # Prefer multiple and longer markers to avoid broad aliases winning ties.
             score = (len(hits), max(len(marker) for marker in hits), sum(len(marker) for marker in hits))
             scores.append((score, vendor))
     return max(scores)[1] if scores else "Unknown"
@@ -97,21 +153,28 @@ def save_local_vendor_rules(root, rules, metadata=None):
     path = local_rules_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Rewriting the file through this function also drops previously learned malformed
+    # rules that the stricter loader rejected.
     existing = {name.lower(): (name, list(markers)) for name, markers in load_local_vendor_rules(root)}
+    rejected_new = []
+
     for name, markers in rules:
-        key = name.lower().strip()
-        if not key:
+        valid, reason = validate_learned_vendor_name(name)
+        if not valid:
+            rejected_new.append((name, reason))
             continue
+        key = name.lower().strip()
         old_name, old_markers = existing.get(key, (name, []))
         seen = {m.lower() for m in old_markers}
         for marker in markers:
+            marker = str(marker).strip()
             if marker and marker.lower() not in seen:
                 old_markers.append(marker)
                 seen.add(marker.lower())
         existing[key] = (old_name, old_markers)
 
     payload = {
-        "version": 1,
+        "version": 2,
         "private_local_file": True,
         "note": "Generated from local PDF evidence. Do not commit or share without review.",
         "rules": [
@@ -121,6 +184,10 @@ def save_local_vendor_rules(root, rules, metadata=None):
     }
     if metadata:
         payload["metadata"] = metadata
+    if rejected_new:
+        payload["last_rejected_candidates"] = [
+            {"name": name, "reason": reason} for name, reason in rejected_new
+        ]
 
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path

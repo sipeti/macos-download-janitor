@@ -24,9 +24,32 @@ from downloads_organizer import (
 )
 from vendor_rules import (
     all_vendor_rules,
-    load_local_vendor_rules,
     load_local_vendor_rules_with_rejections,
 )
+
+
+STRONG_KIND_MARKERS = {
+    "Statements": {
+        "bankszámlakivonat", "bankszamlakivonat", "számlakivonat", "szamlakivonat",
+        "account statement", "bank statement", "nyitó egyenleg", "nyito egyenleg",
+        "záró egyenleg", "zaro egyenleg",
+    },
+    "Invoices": {
+        "számla sorszáma", "szamla sorszama", "invoice number",
+        "teljesítés dátuma", "teljesites datuma",
+    },
+    "Insurance": {
+        "biztosítási kötvény", "biztositasi kotveny", "kötvényszám", "kotvenyszam",
+        "insurance policy", "díjértesítő", "dijertesito",
+    },
+    "Tax": {
+        "adófolyószámla", "adofolyoszamla", "adóbevallás", "adobevallas",
+        "nav.gov.hu", "nemzeti adó- és vámhivatal", "nemzeti ado- es vamhivatal",
+    },
+    "Contracts": {
+        "szerződés", "szerzodes", "megállapodás", "megallapodas",
+    },
+}
 
 
 def iter_managed_pdfs(root):
@@ -39,39 +62,50 @@ def iter_managed_pdfs(root):
     )
 
 
-def semantic_evidence_is_strong(reason, kind):
-    """Recognize the same semantic strength that produced a medium PDF score.
-
-    A known vendor plus either two kind markers or one long/specific marker is strong
-    enough for managed-tree reclassification. Vendor recognition alone is not enough.
-    """
+def reason_hits(reason, kind):
     prefix = f"{kind}: "
     for part in reason.split("; "):
-        if not part.startswith(prefix):
-            continue
-        hits = [hit.strip() for hit in part[len(prefix):].split(",") if hit.strip()]
-        if len(hits) >= 2:
-            return True
-        if any(len(hit) > 10 for hit in hits):
-            return True
-    return False
+        if part.startswith(prefix):
+            return [hit.strip().lower() for hit in part[len(prefix):].split(",") if hit.strip()]
+    return []
+
+
+def semantic_evidence_is_strong(reason, kind):
+    """Require an explicit kind-specific anchor before managed-tree auto moves.
+
+    Generic words such as `számla`, `invoice`, `fizetendő`, `contract`, or
+    `biztosítás` are useful for review ranking but are not sufficient on their own for
+    automatic reclassification. This prevents things like bank/tax documents from
+    becoming invoices just because those words occur somewhere in the PDF.
+    """
+    hits = reason_hits(reason, kind)
+    strong = {marker.lower() for marker in STRONG_KIND_MARKERS.get(kind, set())}
+    return any(hit in strong for hit in hits)
 
 
 def managed_decision(path, root, kind, vendor, confidence, reason, dest_dir, text_backend):
     """Return (action, desired_parent, effective_confidence, reason)."""
     effective_confidence = confidence
     effective_reason = reason
+    strong_kind = semantic_evidence_is_strong(reason, kind)
 
-    # The generic inbox classifier deliberately keeps this combination at medium.
-    # Inside the explicitly selected managed PDF tree we can be slightly more useful:
-    # if a reviewed vendor rule matches AND the document also has strong semantic kind
-    # evidence, promote it to a safe semantic move.
-    if (
+    # Even a generic classifier "high" result is not auto-moved inside the existing
+    # archive unless it contains a strong semantic anchor for the selected kind.
+    # The managed tree is historical data, so false positives are more expensive than
+    # leaving a file in review.
+    if confidence == "high" and kind != "Other" and not strong_kind:
+        effective_confidence = "review-weak-kind"
+        review_vendor = vendor if vendor != "Unknown" else "Unknown"
+        dest_dir = Path("_PDF") / "_Review" / review_vendor
+        effective_reason = f"{reason}; downgraded:no-strong-kind-anchor"
+
+    # A known vendor plus one strong semantic anchor is useful enough to promote a
+    # medium result in the explicitly selected managed tree.
+    elif (
         confidence == "medium"
         and vendor != "Unknown"
         and kind != "Other"
-        and text_backend != "none"
-        and semantic_evidence_is_strong(reason, kind)
+        and strong_kind
     ):
         effective_confidence = "high+vendor-kind"
         dest_dir = Path("_PDF") / kind / vendor
@@ -163,6 +197,8 @@ def print_summary(rows, root, report):
             destinations[folder][1] += int(row["size_bytes"])
 
     active_rules, rejected_rules = load_local_vendor_rules_with_rejections(root)
+    promoted = sum(1 for r in rows if r["confidence"] == "high+vendor-kind")
+    downgraded = sum(1 for r in rows if r["confidence"] == "review-weak-kind")
 
     print("\nPDF MANAGED TREE AUDIT")
     print("=" * 78)
@@ -173,6 +209,8 @@ def print_summary(rows, root, report):
     print(f"Safe reclassify:     {counts['MOVE']} ({human_size(bytes_by_action['MOVE'])})")
     print(f"Review candidates:   {counts['REVIEW']} ({human_size(bytes_by_action['REVIEW'])})")
     print(f"Sensitive blocked:   {counts['SENSITIVE']}")
+    print(f"Promoted vendor+kind:{promoted:5}")
+    print(f"Weak-high downgraded:{downgraded:5}")
     print(f"Local vendor rules:  {len(active_rules)} active, {len(rejected_rules)} rejected")
     print(f"Local report:        {report}")
 
@@ -238,8 +276,7 @@ def main():
         moves += [r for r in rows if r["action"] == "REVIEW"]
 
     if not moves:
-        print("\nNothing eligible to reclassify with the current confidence rules.")
-        print("No PDFs were moved. Review candidates remain untouched.")
+        print("\nNo eligible PDF moves at the current confidence threshold. Nothing was changed.")
         return
 
     if not ns.yes:
@@ -265,6 +302,8 @@ def main():
         shutil.move(str(src), str(dst))
         moved += 1
 
+    # Remove only directories made empty by our moves, and only under _PDF. Never
+    # remove _PDF itself. This is cosmetic; failures are harmless.
     for directory in sorted((p for p in managed.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
         try:
             directory.rmdir()

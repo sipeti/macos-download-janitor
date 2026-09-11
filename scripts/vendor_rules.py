@@ -39,6 +39,14 @@ LEGAL_SUFFIX_ANY_RE = re.compile(
     re.I,
 )
 
+# Typical prose fragments that can end in a legal-looking word such as "LIMITED".
+# A real company may contain one of these words; several together strongly indicate
+# that PDF text extraction captured a sentence instead of an entity name.
+NARRATIVE_TOKENS = {
+    "either", "express", "implied", "including", "but", "not", "without",
+    "warranty", "warranties", "liability", "liable", "including", "merchantability",
+}
+
 
 def local_rules_path(root):
     return Path(root) / "_Janitor" / "config" / "vendor_rules.json"
@@ -72,7 +80,7 @@ def validate_learned_vendor_name(name):
         return False, "multiline-name"
     if len(name) > 100:
         return False, "name-too-long"
-    if name.startswith(("©", "(", "[", "{")):
+    if name.startswith(("©", "(", "[", "{")) or "©" in name:
         return False, "suspicious-prefix"
 
     suffixes = LEGAL_SUFFIX_ANY_RE.findall(name)
@@ -86,6 +94,15 @@ def validate_learned_vendor_name(name):
         return False, "too-short"
     if len(words) > 12:
         return False, "too-many-words"
+
+    normalized_words = {
+        re.sub(r"[^a-z]+", "", word.lower())
+        for word in words
+    }
+    normalized_words.discard("")
+    if len(normalized_words & NARRATIVE_TOKENS) >= 3:
+        return False, "narrative-text-not-company"
+
     return True, "ok"
 
 

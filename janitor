@@ -106,7 +106,6 @@ def main():
     pvendors.add_argument("--min-count", type=int, default=2, help="Minimum PDF count for recurring candidates")
     pvendors.add_argument("--verbose", action="store_true", help="Show matching filenames; private")
     pvendors.add_argument("--emit-rules", action="store_true", help="Generate local draft VENDOR_RULES suggestions")
-    pvendors.add_argument("--no-pdftotext", action="store_true", help="Disable pdftotext fallback")
 
     m = sub.add_parser("media", help="Downloaded media/image source grouping")
     msub = m.add_subparsers(dest="media_command", required=True)
@@ -168,9 +167,7 @@ def main():
                 args.append("--verbose")
             if ns.emit_rules:
                 args.append("--emit-rules")
-            if ns.no_pdftotext:
-                args.append("--no-pdftotext")
-            run_script("pdf_vendor_discovery.py", args)
+            run_script("pdf_vendor_discovery_v2.py", args)
         run_script("downloads_organizer.py", organizer_args(ns, "pdf"))
 
     if ns.command == "media":

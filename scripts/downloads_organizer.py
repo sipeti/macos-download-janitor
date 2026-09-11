@@ -10,7 +10,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
+from pdf_text import extract_pdf_text
+from vendor_rules import BUILTIN_VENDOR_RULES, all_vendor_rules, load_local_vendor_rules, match_vendor
+
 DEFAULT_ROOT = Path.home() / "Downloads"
+
+# Backward-compatible public alias for older helpers.
+VENDOR_RULES = BUILTIN_VENDOR_RULES
 
 MANAGED_DIRS = {
     "_Janitor", "fromGPT", "fromGPT_inventory", "_ZIP", "_PDF", "_DMG",
@@ -51,7 +57,6 @@ EXTENSIONS = {
     "installer": {".pkg", ".mpkg"},
 }
 
-# Canonical source labels. Rules are intentionally generic and contain no user data.
 SOURCE_RULES = [
     ("ChatGPT", GPT_MARKERS),
     ("YouTube", ("youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ytcontent.com")),
@@ -68,8 +73,6 @@ SOURCE_RULES = [
     ("Telegram", ("web.telegram.org", "telegram.org")),
 ]
 
-# Common downloader/CDN hosts that usually hide the real source. Keep them out of the
-# directory tree; infer a canonical service only when the filename also supports it.
 YOUTUBE_DOWNLOADER_MARKERS = (
     "yt-dl.click", "savenow.to", "oceansaver.in", "iamworker.com",
     "apiyoutube.cc", "vidssave.com", "dlsrv.online", "yt1s",
@@ -78,25 +81,6 @@ YOUTUBE_FILENAME_MARKERS = (
     "youtube", "ytdown", "yt2mp3", "shorts", "1080p", "720p", "480p", "360p",
 )
 TIKTOK_FILENAME_MARKERS = ("tiktok", "ssstik", "snaptik")
-
-VENDOR_RULES = [
-    ("Raiffeisen", ("raiffeisen", "raiffeisen.hu")),
-    ("Signal", ("signal iduna", "signal-iduna", "signal.hu")),
-    ("NAV", ("nav.gov.hu", "nemzeti adó- és vámhivatal", "nemzeti ado- es vamhivatal")),
-    ("OTP", ("otpbank", "otp bank", "otpbank.hu")),
-    ("Erste", ("erste bank", "erstebank", "erstebank.hu")),
-    ("K&H", ("k&h bank", "kh.hu")),
-    ("CIB", ("cib bank", "cib.hu")),
-    ("UniCredit", ("unicredit", "unicreditbank.hu")),
-    ("MBH", ("mbh bank", "mbhbank", "mkb bank", "takarékbank", "takarekbank")),
-    ("MVM", ("mvm", "mvmnext", "mvmnext.hu")),
-    ("EON", ("eon.hu", "e.on", "eon energia")),
-    ("One", ("one.hu", "vodafone", "vodafone.hu")),
-    ("Telekom", ("telekom.hu", "magyar telekom")),
-    ("Allianz", ("allianz", "allianz.hu")),
-    ("Generali", ("generali", "generali.hu")),
-    ("Groupama", ("groupama", "groupama.hu")),
-]
 
 PDF_KIND_RULES = {
     "Statements": (
@@ -153,20 +137,6 @@ def where_froms(path):
     return []
 
 
-def spotlight_text(path):
-    try:
-        result = subprocess.run(
-            ["mdls", "-raw", "-name", "kMDItemTextContent", str(path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        text = result.stdout.strip()
-        if text and text != "(null)":
-            return text[:250000]
-    except Exception:
-        pass
-    return ""
-
-
 def hostnames(origins):
     result = []
     for origin in origins:
@@ -197,8 +167,6 @@ def source_group(origins, filename=""):
         return "TikTok"
 
     if hosts:
-        # Preserve the original domain only for ordinary sites. This is still useful
-        # for downloaded reference images and documents from a known publisher/vendor.
         host = hosts[0]
         return re.sub(r"[^a-zA-Z0-9._-]+", "_", host)[:80]
 
@@ -230,20 +198,10 @@ def junk_reason(path, size):
     return ""
 
 
-def match_vendor(haystack):
-    h = haystack.lower()
-    scores = []
-    for vendor, markers in VENDOR_RULES:
-        score = sum(1 for marker in markers if marker.lower() in h)
-        if score:
-            scores.append((score, vendor))
-    return max(scores)[1] if scores else "Unknown"
-
-
-def classify_pdf(path, origins):
-    text = spotlight_text(path)
+def classify_pdf(path, origins, vendor_rules):
+    text, text_backend, _diagnostics = extract_pdf_text(path, max_pages=3)
     haystack = "\n".join([path.name, " ".join(origins), text]).lower()
-    vendor = match_vendor(haystack)
+    vendor = match_vendor(haystack, vendor_rules)
 
     kind_scores = {}
     reasons = []
@@ -263,8 +221,6 @@ def classify_pdf(path, origins):
     if score == 0:
         kind = "Other"
 
-    # Vendor evidence improves our confidence in a useful bucket but does not invent
-    # the document kind. Low/medium-confidence PDFs are staged under _PDF/_Review.
     if score >= 4:
         confidence = "high"
     elif score >= 2 or (score >= 1 and vendor != "Unknown"):
@@ -278,7 +234,12 @@ def classify_pdf(path, origins):
         review_vendor = vendor if vendor != "Unknown" else "Unknown"
         dest = Path("_PDF") / "_Review" / review_vendor
 
-    return kind, vendor, confidence, "; ".join(reasons), dest
+    if text_backend != "none":
+        reasons.append(f"text:{text_backend}")
+    else:
+        reasons.append("text:none")
+
+    return kind, vendor, confidence, "; ".join(reasons), dest, text_backend
 
 
 def gpt_destination(category, review=False):
@@ -292,7 +253,7 @@ def gpt_destination(category, review=False):
     return base / mapping.get(category, "other")
 
 
-def classify_top_level(path, category, origins, size):
+def classify_top_level(path, category, origins, size, vendor_rules):
     sensitive = sensitive_reason(path)
     if sensitive:
         return "SENSITIVE", None, {
@@ -318,11 +279,11 @@ def classify_top_level(path, category, origins, size):
         }
 
     if category == "pdf":
-        kind, vendor, confidence, reason, dest = classify_pdf(path, origins)
+        kind, vendor, confidence, reason, dest, text_backend = classify_pdf(path, origins, vendor_rules)
         action = "MOVE" if confidence == "high" else "REVIEW"
         return action, dest, {
             "pdf_kind": kind, "vendor": vendor, "confidence": confidence, "reason": reason,
-            "provenance": provenance,
+            "provenance": provenance, "text_backend": text_backend,
         }
 
     if category == "zip":
@@ -371,6 +332,7 @@ def collision_safe(path):
 def scan(root, only):
     """Scan only direct children of Downloads. Nested directories are not traversed."""
     rows = []
+    vendor_rules = all_vendor_rules(root)
     for path in root.iterdir():
         if not path.is_file() or path.name == ".DS_Store":
             continue
@@ -389,7 +351,7 @@ def scan(root, only):
         if not wanted(category, provenance, sensitive, only):
             continue
 
-        action, dest_dir, meta = classify_top_level(path, category, origins, size)
+        action, dest_dir, meta = classify_top_level(path, category, origins, size, vendor_rules)
         destination = str(dest_dir / path.name) if dest_dir else ""
 
         rows.append({
@@ -405,6 +367,7 @@ def scan(root, only):
             "pdf_kind": meta.get("pdf_kind", ""),
             "vendor": meta.get("vendor", ""),
             "confidence": meta.get("confidence", ""),
+            "text_backend": meta.get("text_backend", ""),
             "reason": meta.get("reason", ""),
         })
 
@@ -442,6 +405,7 @@ def print_summary(rows, root, only, report_path):
     print(f"Review candidates:  {counts['REVIEW']} ({human_size(review_bytes)})")
     print(f"Sensitive blocked:  {counts['SENSITIVE']}")
     print(f"Left in place:      {counts['LEAVE']}")
+    print(f"Local vendor rules: {len(load_local_vendor_rules(root))}")
     print(f"Local report:       {report_path}")
 
     if destination_counts:
@@ -470,7 +434,7 @@ def main():
     rows = scan(root, ns.only)
     fields = [
         "path", "category", "size_bytes", "size", "action", "destination", "source_group",
-        "origins", "provenance", "pdf_kind", "vendor", "confidence", "reason",
+        "origins", "provenance", "pdf_kind", "vendor", "confidence", "text_backend", "reason",
     ]
     with open(csv_out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -484,7 +448,7 @@ def main():
         for r in rows:
             extra = ""
             if r["category"] == "pdf":
-                extra = f" [{r['pdf_kind']}/{r['vendor']}/{r['confidence']}]"
+                extra = f" [{r['pdf_kind']}/{r['vendor']}/{r['confidence']}/{r['text_backend'] or 'no-text'}]"
             if r["action"] == "SENSITIVE":
                 print(f"SENSITIVE {r['size']:>10}  {r['path']} [{r['reason']}] - no move")
             elif r["destination"]:

@@ -26,7 +26,16 @@ SELLER_HINTS = (
 )
 BUYER_HINTS = (
     "vevő", "vevo", "buyer", "customer", "ügyfél", "ugyfel", "megrendelő", "megrendelo",
-    "számlafizető", "szamlafizeto", "bill to", "ship to",
+    "számlafizető", "szamlafizeto", "bill to", "ship to", "receiver", "recipient", "címzett", "cimzett",
+)
+
+# These words may appear before the actual company name because PDF text extraction
+# flattens tables/labels. They are stripped from the detected entity itself.
+ENTITY_PREFIX_RE = re.compile(
+    r"^(?:(?:eladó|elado|szállító|szallito|kibocsátó|kibocsato|szolgáltató|szolgaltato|"
+    r"értékesítő|ertekesito|supplier|seller|vendor|issuer|merchant|provider|forgalmazó|forgalmazo|"
+    r"vevő|vevo|buyer|customer|receiver|recipient|címzett|cimzett|bill\s+to|ship\s+to)\s*[:\-]?\s*)+",
+    re.I,
 )
 
 COMPANY_CONNECTORS = {
@@ -45,6 +54,12 @@ GENERIC_HOST_SUFFIXES = (
     "googleusercontent.com", "google.com", "gmail.com", "icloud.com", "apple.com",
     "amazonaws.com", "cloudfront.net", "office.com", "microsoft.com", "live.com",
 )
+LEGAL_WORDS = {
+    "kft", "zrt", "nyrt", "bt", "kkt", "ltd", "limited", "gmbh", "ag", "inc", "llc", "bv", "sa", "sas", "sro", "sp", "zo", "oo",
+}
+BRAND_STOPWORDS = {
+    "bank", "online", "group", "hungary", "magyarorszag", "service", "services", "szolgaltato", "biztosito",
+}
 
 
 def accentfold(value):
@@ -59,6 +74,18 @@ def normalize_key(value):
 
 def strip_token(token):
     return token.strip(" \t\r\n,;:!?[]{}<>\"'“”„’`")
+
+
+def clean_entity_prefix(entity):
+    entity = re.sub(r"\s+", " ", entity).strip(" ,;:-")
+    entity = ENTITY_PREFIX_RE.sub("", entity).strip(" ,;:-")
+
+    # Articles are common table/paragraph glue, but only strip them if enough of the
+    # entity remains to avoid damaging legitimate one-word brands.
+    parts = entity.split()
+    if len(parts) >= 3 and accentfold(parts[0]).lower().strip(".") in {"a", "az", "the"}:
+        entity = " ".join(parts[1:])
+    return entity.strip(" ,;:-")
 
 
 def companyish_token(token):
@@ -76,10 +103,8 @@ def companyish_token(token):
         return True
     if any(ch.isdigit() for ch in token):
         return True
-    # Short business abbreviations are often lowercase after PDF text extraction.
     if token.endswith(".") and len(token) <= 6:
         return True
-    # Domain-like brand names such as alza.hu.
     if "." in token and any(ch.isalpha() for ch in token):
         return True
     return False
@@ -115,14 +140,11 @@ def entity_before_suffix(line, suffix_start, suffix_end):
     if not picked:
         return ""
 
-    entity = " ".join([*picked, suffix])
-    entity = re.sub(r"\s+", " ", entity).strip(" ,;:-")
+    entity = clean_entity_prefix(" ".join([*picked, suffix]))
     key = normalize_key(entity)
     if not key or key in GENERIC_ENTITY_KEYS:
         return ""
-
-    # A legal entity should have something meaningful before the suffix.
-    if len(picked) == 1 and len(normalize_key(picked[0])) < 2:
+    if len(entity.split()) < 2:
         return ""
     return entity[:140]
 
@@ -143,6 +165,12 @@ def canonical_entity(entity):
     known = match_vendor(entity)
     if known != "Unknown":
         return known, f"known:{normalize_key(known)}", known
+
+    # Public, generic normalization for a historical Signal company-name variant.
+    folded = normalize_key(entity)
+    if "signal biztosito" in folded or "signal iduna biztosito" in folded:
+        return "Signal", "known:signal", "Signal"
+
     return entity, normalize_key(entity), ""
 
 
@@ -164,13 +192,15 @@ def extract_entities(text):
             display, key, known = canonical_entity(raw_entity)
             if len(key) < 3:
                 continue
-            found.append((display, key, role, context[:700], raw_entity, known))
+            found.append((display, key, role, context[:700], raw_entity, known, idx))
 
-    # Deduplicate the same entity/role within one document.
+    # Deduplicate within one document, preferring the earliest occurrence for evidence.
     unique = {}
     for item in found:
-        display, key, role, *_ = item
-        unique[(key, role)] = item
+        display, key, role, *_rest, idx = item
+        old = unique.get((key, role))
+        if old is None or idx < old[-1]:
+            unique[(key, role)] = item
     return list(unique.values())
 
 
@@ -185,6 +215,24 @@ def source_hosts(origins):
             continue
         hosts.append(host)
     return sorted(set(hosts))
+
+
+def brand_tokens(entity):
+    tokens = normalize_key(entity).split()
+    return [
+        t for t in tokens
+        if len(t) >= 3 and t not in LEGAL_WORDS and t not in BRAND_STOPWORDS
+    ]
+
+
+def source_matches_entity(entity, hosts):
+    if not hosts:
+        return False
+    tokens = brand_tokens(entity)
+    if not tokens:
+        return False
+    host_blob = " ".join(accentfold(h).lower() for h in hosts)
+    return any(token in host_blob for token in tokens[:4])
 
 
 def company_markers(name, hosts):
@@ -213,6 +261,7 @@ def main():
     ap.add_argument("--root", default=str(DEFAULT_ROOT))
     ap.add_argument("--min-count", type=int, default=2, help="Minimum PDF count for recurring candidates")
     ap.add_argument("--verbose", action="store_true", help="Show matching filenames; may reveal private information")
+    ap.add_argument("--show-mentions", action="store_true", help="Also print recurring company mentions without vendor evidence")
     ap.add_argument("--no-pdftotext", action="store_true", help="Disable pdftotext fallback")
     ap.add_argument("--no-pdfkit", action="store_true", help="Disable native macOS PDFKit fallback")
     ap.add_argument("--emit-rules", action="store_true", help="Write conservative local rule suggestions")
@@ -233,6 +282,8 @@ def main():
     entity_files = defaultdict(list)
     raw_variants = defaultdict(Counter)
     entity_known_vendor = {}
+    entity_header_docs = defaultdict(set)
+    entity_source_docs = defaultdict(set)
 
     for path in pdfs:
         origins = where_froms(path)
@@ -252,13 +303,17 @@ def main():
             known_counts[known] += 1
 
         hosts = source_hosts(origins)
-        for display, key, role, _context, raw_entity, known_vendor in extract_entities(text):
+        for display, key, role, _context, raw_entity, known_vendor, line_idx in extract_entities(text):
             entities.setdefault(key, display)
             entity_docs[key].add(path.name)
             entity_roles[key][role] += 1
             raw_variants[key][raw_entity] += 1
             if known_vendor:
                 entity_known_vendor[key] = known_vendor
+            if line_idx < 25:
+                entity_header_docs[key].add(path.name)
+            if source_matches_entity(display, hosts):
+                entity_source_docs[key].add(path.name)
             for host in hosts:
                 entity_hosts[key][host] += 1
             if len(entity_files[key]) < 20:
@@ -276,17 +331,21 @@ def main():
         buyer_hits = roles["buyer"]
         unknown_hits = roles["unknown"]
         known_vendor = entity_known_vendor.get(key, "")
+        header_hits = len(entity_header_docs[key])
+        source_hits = len(entity_source_docs[key])
 
         if known_vendor:
             confidence = "known"
         elif seller_hits >= 2 and seller_hits > buyer_hits:
             confidence = "high"
+        elif source_hits >= 2 and buyer_hits == 0:
+            confidence = "high"
         elif seller_hits >= 1 and seller_hits >= buyer_hits:
             confidence = "medium"
-        elif doc_count >= 3 and buyer_hits == 0:
+        elif source_hits >= 1 and buyer_hits == 0:
             confidence = "medium"
         else:
-            confidence = "low"
+            confidence = "mention"
 
         rows.append({
             "candidate": entities[key],
@@ -294,22 +353,27 @@ def main():
             "seller_hits": seller_hits,
             "buyer_hits": buyer_hits,
             "unknown_hits": unknown_hits,
+            "header_hits": header_hits,
+            "source_hits": source_hits,
             "confidence": confidence,
             "known_vendor": known_vendor,
             "source_hosts": " | ".join(host for host, _ in entity_hosts[key].most_common(6)),
             "raw_variants": " | ".join(name for name, _ in raw_variants[key].most_common(6)),
         })
 
-    rank = {"known": 0, "high": 1, "medium": 2, "low": 3}
-    rows.sort(key=lambda r: (rank.get(r["confidence"], 9), -int(r["seller_hits"]), -int(r["documents"]), r["candidate"].lower()))
+    rank = {"known": 0, "high": 1, "medium": 2, "mention": 3}
+    rows.sort(key=lambda r: (rank.get(r["confidence"], 9), -int(r["source_hits"]), -int(r["seller_hits"]), -int(r["documents"]), r["candidate"].lower()))
 
     with open(summary_csv, "w", newline="", encoding="utf-8-sig") as f:
-        fields = ["candidate", "documents", "seller_hits", "buyer_hits", "unknown_hits", "confidence", "known_vendor", "source_hosts", "raw_variants"]
+        fields = [
+            "candidate", "documents", "seller_hits", "buyer_hits", "unknown_hits",
+            "header_hits", "source_hits", "confidence", "known_vendor", "source_hosts", "raw_variants",
+        ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader(); w.writerows(rows)
 
     with open(detail_csv, "w", newline="", encoding="utf-8-sig") as f:
-        fields = ["candidate", "filename", "roles", "source_hosts"]
+        fields = ["candidate", "filename", "roles", "header_evidence", "source_evidence", "source_hosts"]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for row in rows:
@@ -319,6 +383,8 @@ def main():
                     "candidate": row["candidate"],
                     "filename": filename,
                     "roles": ",".join(sorted(entity_roles[key].keys())),
+                    "header_evidence": "yes" if filename in entity_header_docs[key] else "no",
+                    "source_evidence": "yes" if filename in entity_source_docs[key] else "no",
                     "source_hosts": row["source_hosts"],
                 })
 
@@ -347,28 +413,44 @@ def main():
             print(f"  {count:4}  {vendor}")
 
     recurring = [r for r in rows if int(r["documents"]) >= ns.min_count]
-    if recurring:
-        print(f"\nRecurring entity candidates (>= {ns.min_count} PDFs):")
-        for r in recurring[:80]:
+    vendor_candidates = [r for r in recurring if r["confidence"] != "mention"]
+    mentions = [r for r in recurring if r["confidence"] == "mention"]
+
+    if vendor_candidates:
+        print(f"\nProbable vendor candidates (>= {ns.min_count} PDFs):")
+        for r in vendor_candidates[:80]:
             known_tag = " [known]" if r["known_vendor"] else ""
             print(
-                f"  {r['documents']:4} docs  seller={r['seller_hits']:>3}  buyer={r['buyer_hits']:>3}  "
-                f"unknown={r['unknown_hits']:>3}  {r['confidence']:<6}  {r['candidate']}{known_tag}"
+                f"  {r['documents']:4} docs  seller={r['seller_hits']:>3}  source={r['source_hits']:>3}  "
+                f"header={r['header_hits']:>3}  buyer={r['buyer_hits']:>3}  {r['confidence']:<7}  {r['candidate']}{known_tag}"
             )
             if ns.verbose:
                 key = f"known:{normalize_key(r['known_vendor'])}" if r["known_vendor"] else normalize_key(r["candidate"])
                 for filename in entity_files[key][:8]:
                     print(f"        {filename}")
     else:
-        print(f"\nNo entity candidate appeared in at least {ns.min_count} PDFs.")
+        print(f"\nNo probable vendor candidate appeared in at least {ns.min_count} PDFs.")
+
+    if mentions:
+        if ns.show_mentions:
+            print(f"\nRecurring company mentions without vendor evidence (>= {ns.min_count} PDFs):")
+            for r in mentions[:80]:
+                print(
+                    f"  {r['documents']:4} docs  header={r['header_hits']:>3}  buyer={r['buyer_hits']:>3}  "
+                    f"mention  {r['candidate']}"
+                )
+        else:
+            print(f"\nRecurring non-vendor company mentions hidden: {len(mentions)} (use --show-mentions to inspect)")
 
     if ns.emit_rules:
         emitted = []
-        for r in recurring:
-            if r["known_vendor"]:
+        for r in vendor_candidates:
+            if r["known_vendor"] or r["confidence"] not in {"high", "medium"}:
                 continue
-            # Do not learn a rule from buyer-side occurrences or mere narrative mentions.
-            if int(r["seller_hits"]) < 1 or int(r["buyer_hits"]) > 0:
+            # Learning requires positive vendor evidence and no buyer-side evidence.
+            if int(r["buyer_hits"]) > 0:
+                continue
+            if int(r["seller_hits"]) < 1 and int(r["source_hits"]) < 1:
                 continue
             key = normalize_key(r["candidate"])
             hosts = [h for h, _ in entity_hosts[key].most_common(4)]
@@ -379,7 +461,10 @@ def main():
             f.write("# May contain company names inferred from private PDFs; this path is gitignored.\n\n")
             f.write("VENDOR_RULE_SUGGESTIONS = [\n")
             for name, markers, row in emitted:
-                f.write(f"    # docs={row['documents']} seller={row['seller_hits']} buyer={row['buyer_hits']} confidence={row['confidence']}\n")
+                f.write(
+                    f"    # docs={row['documents']} seller={row['seller_hits']} source={row['source_hits']} "
+                    f"buyer={row['buyer_hits']} confidence={row['confidence']}\n"
+                )
                 f.write(f"    ({name!r}, {tuple(markers)!r}),\n")
             f.write("]\n")
         print(f"\nDraft rules:          {rules_path}")

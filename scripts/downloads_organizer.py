@@ -6,7 +6,7 @@ import plistlib
 import re
 import shutil
 import subprocess
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -18,6 +18,25 @@ MANAGED_DIRS = {
 }
 
 GPT_MARKERS = ("chatgpt.com", "openai.com", "oaiusercontent.com")
+GPT_FILENAME_PATTERNS = (
+    re.compile(r"^chatgpt[ _-]+image\b", re.I),
+    re.compile(r"\bchatgpt\b", re.I),
+)
+
+SENSITIVE_FILENAME_PATTERNS = (
+    ("2fa", re.compile(r"(?:^|[^a-z0-9])2fa(?:[^a-z0-9]|$)", re.I)),
+    ("totp", re.compile(r"\btotp\b", re.I)),
+    ("recovery-code", re.compile(r"\brecovery[ _-]*codes?\b", re.I)),
+    ("backup-code", re.compile(r"\bbackup[ _-]*codes?\b", re.I)),
+    ("secret", re.compile(r"\bsecret(?:s)?\b", re.I)),
+    ("private-key", re.compile(r"\bprivate[ _-]*key\b", re.I)),
+    ("password", re.compile(r"\bpass(?:word|wd)s?\b", re.I)),
+    ("credential", re.compile(r"\bcredentials?\b", re.I)),
+    ("token", re.compile(r"\b(?:api[ _-]*)?tokens?\b", re.I)),
+    ("identity-document", re.compile(r"\b(?:passport|szemelyi|személyi|lakcim|lakcím|taj[_ -]?kartya|taj[_ -]?kártya)\b", re.I)),
+)
+
+TEMP_OFFICE_RE = re.compile(r"^~\$", re.I)
 
 EXTENSIONS = {
     "pdf": {".pdf"},
@@ -32,17 +51,33 @@ EXTENSIONS = {
     "installer": {".pkg", ".mpkg"},
 }
 
+# Canonical source labels. Rules are intentionally generic and contain no user data.
 SOURCE_RULES = [
     ("ChatGPT", GPT_MARKERS),
-    ("YouTube", ("youtube.com", "youtu.be", "googlevideo.com", "ytimg.com")),
+    ("YouTube", ("youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ytcontent.com")),
     ("Facebook", ("facebook.com", "fbcdn.net", "fb.watch")),
+    ("Messenger", ("messenger.com",)),
     ("Instagram", ("instagram.com", "cdninstagram.com")),
-    ("TikTok", ("tiktok.com", "tiktokcdn.com", "muscdn.com")),
+    ("TikTok", ("tiktok.com", "tiktokcdn.com", "muscdn.com", "tikcdn.io", "ssstik.io")),
     ("X-Twitter", ("twitter.com", "x.com", "twimg.com")),
     ("Vimeo", ("vimeo.com", "vimeocdn.com")),
-    ("GoogleDrive", ("drive.google.com", "docs.google.com")),
+    ("GoogleDrive", ("drive.google.com", "docs.google.com", "drive.usercontent.google.com", "video-downloads.googleusercontent.com")),
+    ("Gmail", ("mail-attachment.googleusercontent.com",)),
+    ("WeTransfer", ("wetransfer.com", "download.wetransfer.com")),
     ("Dropbox", ("dropbox.com", "dropboxusercontent.com")),
+    ("Telegram", ("web.telegram.org", "telegram.org")),
 ]
+
+# Common downloader/CDN hosts that usually hide the real source. Keep them out of the
+# directory tree; infer a canonical service only when the filename also supports it.
+YOUTUBE_DOWNLOADER_MARKERS = (
+    "yt-dl.click", "savenow.to", "oceansaver.in", "iamworker.com",
+    "apiyoutube.cc", "vidssave.com", "dlsrv.online", "yt1s",
+)
+YOUTUBE_FILENAME_MARKERS = (
+    "youtube", "ytdown", "yt2mp3", "shorts", "1080p", "720p", "480p", "360p",
+)
+TIKTOK_FILENAME_MARKERS = ("tiktok", "ssstik", "snaptik")
 
 VENDOR_RULES = [
     ("Raiffeisen", ("raiffeisen", "raiffeisen.hu")),
@@ -50,7 +85,7 @@ VENDOR_RULES = [
     ("NAV", ("nav.gov.hu", "nemzeti adó- és vámhivatal", "nemzeti ado- es vamhivatal")),
     ("OTP", ("otpbank", "otp bank", "otpbank.hu")),
     ("Erste", ("erste bank", "erstebank", "erstebank.hu")),
-    ("K&H", ("k&h bank", "kh.hu", "k&H")),
+    ("K&H", ("k&h bank", "kh.hu")),
     ("CIB", ("cib bank", "cib.hu")),
     ("UniCredit", ("unicredit", "unicreditbank.hu")),
     ("MBH", ("mbh bank", "mbhbank", "mkb bank", "takarékbank", "takarekbank")),
@@ -66,7 +101,8 @@ VENDOR_RULES = [
 PDF_KIND_RULES = {
     "Statements": (
         "bankszámlakivonat", "bankszamlakivonat", "számlakivonat", "szamlakivonat",
-        "account statement", "nyitó egyenleg", "nyito egyenleg", "záró egyenleg", "zaro egyenleg",
+        "account statement", "bank statement", "statement_", "nyitó egyenleg", "nyito egyenleg",
+        "záró egyenleg", "zaro egyenleg",
     ),
     "Invoices": (
         "számla sorszáma", "szamla sorszama", "fizetendő", "fizetendo", "teljesítés dátuma",
@@ -74,7 +110,7 @@ PDF_KIND_RULES = {
     ),
     "Insurance": (
         "biztosítási kötvény", "biztositasi kotveny", "kötvényszám", "kotvenyszam",
-        "biztosítás", "biztositas", "insurance policy", "díjértesítő", "dijertesito",
+        "biztosítás", "biztositas", "insurance policy", "díjértesítő", "dijertesito", "kotveny", "kötvény",
     ),
     "Tax": (
         "adófolyószámla", "adofolyoszamla", "adóbevallás", "adobevallas", "nav.gov.hu",
@@ -131,27 +167,67 @@ def spotlight_text(path):
     return ""
 
 
-def source_group(origins):
-    lowered = " ".join(origins).lower()
-    for label, markers in SOURCE_RULES:
-        if any(marker.lower() in lowered for marker in markers):
-            return label
-
+def hostnames(origins):
+    result = []
     for origin in origins:
         try:
             host = (urlparse(origin).hostname or "").lower()
         except Exception:
             host = ""
         if host:
-            host = re.sub(r"^www\.", "", host)
-            return re.sub(r"[^a-zA-Z0-9._-]+", "_", host)[:80]
+            result.append(re.sub(r"^www\.", "", host))
+    return result
+
+
+def source_group(origins, filename=""):
+    lowered = " ".join(origins).lower()
+    name = filename.lower()
+
+    for label, markers in SOURCE_RULES:
+        if any(marker.lower() in lowered for marker in markers):
+            return label
+
+    hosts = hostnames(origins)
+    if any(any(marker in host for marker in YOUTUBE_DOWNLOADER_MARKERS) for host in hosts):
+        if any(marker in name for marker in YOUTUBE_FILENAME_MARKERS):
+            return "YouTube"
+        return "Downloader"
+
+    if any(marker in name for marker in TIKTOK_FILENAME_MARKERS):
+        return "TikTok"
+
+    if hosts:
+        # Preserve the original domain only for ordinary sites. This is still useful
+        # for downloaded reference images and documents from a known publisher/vendor.
+        host = hosts[0]
+        return re.sub(r"[^a-zA-Z0-9._-]+", "_", host)[:80]
 
     return "Unknown"
 
 
-def is_gpt(origins):
+def gpt_provenance(path, origins):
     lowered = " ".join(origins).lower()
-    return any(marker in lowered for marker in GPT_MARKERS)
+    if any(marker in lowered for marker in GPT_MARKERS):
+        return "confirmed"
+    if any(pattern.search(path.name) for pattern in GPT_FILENAME_PATTERNS):
+        return "probable"
+    return "no"
+
+
+def sensitive_reason(path):
+    name = path.name
+    for label, pattern in SENSITIVE_FILENAME_PATTERNS:
+        if pattern.search(name):
+            return label
+    return ""
+
+
+def junk_reason(path, size):
+    if TEMP_OFFICE_RE.search(path.name):
+        return "office-lock-file"
+    if size == 0:
+        return "zero-byte-file"
+    return ""
 
 
 def match_vendor(haystack):
@@ -187,65 +263,98 @@ def classify_pdf(path, origins):
     if score == 0:
         kind = "Other"
 
-    if kind == "Statements":
-        dest = Path("_PDF") / "Statements" / vendor
-    elif kind == "Invoices":
-        dest = Path("_PDF") / "Invoices" / vendor
-    elif kind == "Insurance":
-        dest = Path("_PDF") / "Insurance" / vendor
-    elif kind == "Tax":
-        dest = Path("_PDF") / "Tax" / vendor
-    elif kind == "Contracts":
-        dest = Path("_PDF") / "Contracts" / vendor
-    elif vendor != "Unknown":
-        dest = Path("_PDF") / "BySource" / vendor
+    # Vendor evidence improves our confidence in a useful bucket but does not invent
+    # the document kind. Low/medium-confidence PDFs are staged under _PDF/_Review.
+    if score >= 4:
+        confidence = "high"
+    elif score >= 2 or (score >= 1 and vendor != "Unknown"):
+        confidence = "medium"
     else:
-        dest = Path("_PDF") / "Other"
+        confidence = "low"
 
-    confidence = "high" if score >= 4 else "medium" if score >= 2 else "low"
+    if confidence == "high":
+        dest = Path("_PDF") / kind / vendor
+    else:
+        review_vendor = vendor if vendor != "Unknown" else "Unknown"
+        dest = Path("_PDF") / "_Review" / review_vendor
+
     return kind, vendor, confidence, "; ".join(reasons), dest
 
 
-def gpt_destination(category):
+def gpt_destination(category, review=False):
     mapping = {
         "images": "images", "video": "video", "audio": "audio", "pdf": "pdf",
         "zip": "zips", "csv": "csv", "documents": "documents", "code": "code",
     }
-    return Path("fromGPT") / mapping.get(category, "other")
+    base = Path("fromGPT")
+    if review:
+        base /= "_Review"
+    return base / mapping.get(category, "other")
 
 
-def destination_for(path, category, origins):
-    if is_gpt(origins):
-        return gpt_destination(category), {"pdf_kind": "", "vendor": "ChatGPT", "confidence": "high", "reason": "ChatGPT/OpenAI origin"}
+def classify_top_level(path, category, origins, size):
+    sensitive = sensitive_reason(path)
+    if sensitive:
+        return "SENSITIVE", None, {
+            "confidence": "blocked", "reason": sensitive, "provenance": gpt_provenance(path, origins),
+        }
+
+    junk = junk_reason(path, size)
+    if junk:
+        return "REVIEW", Path("_Janitor") / "review" / "junk-candidates", {
+            "confidence": "review", "reason": junk, "provenance": gpt_provenance(path, origins),
+        }
+
+    provenance = gpt_provenance(path, origins)
+    if provenance == "confirmed":
+        return "MOVE", gpt_destination(category), {
+            "confidence": "high", "reason": "ChatGPT/OpenAI origin metadata", "provenance": provenance,
+            "vendor": "ChatGPT",
+        }
+    if provenance == "probable":
+        return "REVIEW", gpt_destination(category, review=True), {
+            "confidence": "medium", "reason": "ChatGPT-like filename without origin metadata", "provenance": provenance,
+            "vendor": "ChatGPT",
+        }
 
     if category == "pdf":
         kind, vendor, confidence, reason, dest = classify_pdf(path, origins)
-        return dest, {"pdf_kind": kind, "vendor": vendor, "confidence": confidence, "reason": reason}
+        action = "MOVE" if confidence == "high" else "REVIEW"
+        return action, dest, {
+            "pdf_kind": kind, "vendor": vendor, "confidence": confidence, "reason": reason,
+            "provenance": provenance,
+        }
 
     if category == "zip":
-        return Path("_ZIP"), {}
+        return "MOVE", Path("_ZIP"), {"confidence": "high", "provenance": provenance}
     if category == "dmg":
-        return Path("_DMG"), {}
+        return "MOVE", Path("_DMG"), {"confidence": "high", "provenance": provenance}
     if category == "installer":
-        return Path("_Installers"), {}
+        return "MOVE", Path("_Installers"), {"confidence": "high", "provenance": provenance}
     if category in {"images", "video", "audio"}:
-        source = source_group(origins)
-        return Path("_Media") / source / category, {"vendor": source}
+        source = source_group(origins, path.name)
+        return "MOVE", Path("_Media") / source / category, {
+            "vendor": source, "confidence": "high" if source != "Unknown" else "medium", "provenance": provenance,
+        }
     if category in {"documents", "csv", "code"}:
-        return Path("_Documents") / category, {}
+        return "MOVE", Path("_Documents") / category, {"confidence": "high", "provenance": provenance}
 
-    return None, {}
+    return "LEAVE", None, {"confidence": "none", "provenance": provenance}
 
 
-def wanted(category, origins, only):
+def wanted(category, provenance, sensitive, only):
     if only == "all":
         return True
     if only == "gpt":
-        return is_gpt(origins)
+        return provenance in {"confirmed", "probable"}
     if only == "media":
         return category in {"images", "video", "audio"}
     if only == "documents":
         return category in {"documents", "csv", "code"}
+    if only == "sensitive":
+        return bool(sensitive)
+    if only == "junk":
+        return True
     return category == only
 
 
@@ -260,98 +369,141 @@ def collision_safe(path):
 
 
 def scan(root, only):
+    """Scan only direct children of Downloads. Nested directories are not traversed."""
     rows = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            rel = path.relative_to(root)
-        except ValueError:
-            continue
-        if rel.parts and rel.parts[0] in MANAGED_DIRS:
-            continue
-        if path.name == ".DS_Store":
+    for path in root.iterdir():
+        if not path.is_file() or path.name == ".DS_Store":
             continue
 
         category = category_for(path)
         origins = where_froms(path)
-        if not wanted(category, origins, only):
-            continue
-
-        is_top = len(rel.parts) == 1
-        dest_dir, meta = destination_for(path, category, origins)
-        if not is_top:
-            action = "WARN_NESTED"
-            dest = ""
-        elif dest_dir is None:
-            action = "LEAVE"
-            dest = ""
-        else:
-            action = "MOVE"
-            dest = str(dest_dir / path.name)
-
+        provenance = gpt_provenance(path, origins)
+        sensitive = sensitive_reason(path)
         try:
             size = path.stat().st_size
         except OSError:
             size = 0
 
+        if only == "junk" and not junk_reason(path, size):
+            continue
+        if not wanted(category, provenance, sensitive, only):
+            continue
+
+        action, dest_dir, meta = classify_top_level(path, category, origins, size)
+        destination = str(dest_dir / path.name) if dest_dir else ""
+
         rows.append({
-            "path": str(rel), "top_level": "yes" if is_top else "no", "category": category,
-            "size_bytes": size, "size": human_size(size), "action": action, "destination": dest,
-            "source_group": source_group(origins), "origins": " | ".join(origins),
-            "pdf_kind": meta.get("pdf_kind", ""), "vendor": meta.get("vendor", ""),
-            "confidence": meta.get("confidence", ""), "reason": meta.get("reason", ""),
+            "path": path.name,
+            "category": category,
+            "size_bytes": size,
+            "size": human_size(size),
+            "action": action,
+            "destination": destination,
+            "source_group": source_group(origins, path.name),
+            "origins": " | ".join(origins),
+            "provenance": meta.get("provenance", provenance),
+            "pdf_kind": meta.get("pdf_kind", ""),
+            "vendor": meta.get("vendor", ""),
+            "confidence": meta.get("confidence", ""),
+            "reason": meta.get("reason", ""),
         })
-    rows.sort(key=lambda r: (0 if r["action"] == "MOVE" else 1, -int(r["size_bytes"]), r["path"].lower()))
+
+    order = {"SENSITIVE": 0, "REVIEW": 1, "MOVE": 2, "LEAVE": 3}
+    rows.sort(key=lambda r: (order.get(r["action"], 9), -int(r["size_bytes"]), r["path"].lower()))
     return rows
 
 
+def redacted_row(row):
+    return {
+        **row,
+        "path": "[REDACTED]",
+        "origins": "[REDACTED]" if row["origins"] else "",
+        "destination": str(Path(row["destination"]).parent / "[REDACTED]") if row["destination"] else "",
+    }
+
+
+def print_summary(rows, root, only, report_path):
+    counts = Counter(r["action"] for r in rows)
+    move_bytes = sum(int(r["size_bytes"]) for r in rows if r["action"] == "MOVE")
+    review_bytes = sum(int(r["size_bytes"]) for r in rows if r["action"] == "REVIEW")
+    destination_counts = defaultdict(lambda: [0, 0])
+    for r in rows:
+        if r["destination"]:
+            folder = str(Path(r["destination"]).parent)
+            destination_counts[folder][0] += 1
+            destination_counts[folder][1] += int(r["size_bytes"])
+
+    print("\nDOWNLOADS ORGANIZER")
+    print("=" * 78)
+    print(f"Root:               {root}")
+    print(f"Filter:             {only}")
+    print("Scope:              top-level files only (nested directories ignored)")
+    print(f"Safe moves:         {counts['MOVE']} ({human_size(move_bytes)})")
+    print(f"Review candidates:  {counts['REVIEW']} ({human_size(review_bytes)})")
+    print(f"Sensitive blocked:  {counts['SENSITIVE']}")
+    print(f"Left in place:      {counts['LEAVE']}")
+    print(f"Local report:       {report_path}")
+
+    if destination_counts:
+        print("\nDestination summary:")
+        for folder, (count, total) in sorted(destination_counts.items(), key=lambda x: (-x[1][1], x[0])):
+            print(f"  {count:5}  {human_size(total):>10}  {folder}")
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Privacy-first organizer for top-level ~/Downloads files.")
     ap.add_argument("--root", default=str(DEFAULT_ROOT))
-    ap.add_argument("--only", choices=["all", "pdf", "zip", "dmg", "media", "gpt", "documents"], default="all")
-    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--only", choices=["all", "pdf", "zip", "dmg", "media", "gpt", "documents", "sensitive", "junk"], default="all")
+    ap.add_argument("--apply", action="store_true", help="Move safe/high-confidence candidates")
+    ap.add_argument("--include-review", action="store_true", help="With --apply, also move review candidates to staging folders")
     ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--verbose", action="store_true", help="Print filenames and detailed decisions")
+    ap.add_argument("--redact-report", action="store_true", help="Hide filenames and origin URLs in the CSV report")
     ns = ap.parse_args()
 
     root = Path(ns.root).expanduser().resolve()
     report_dir = root / "_Janitor" / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
-    csv_out = report_dir / f"downloads_sort_plan_{ns.only}.csv"
+    suffix = "_redacted" if ns.redact_report else ""
+    csv_out = report_dir / f"downloads_sort_plan_{ns.only}{suffix}.csv"
 
     rows = scan(root, ns.only)
-    fields = ["path", "top_level", "category", "size_bytes", "size", "action", "destination", "source_group", "origins", "pdf_kind", "vendor", "confidence", "reason"]
+    fields = [
+        "path", "category", "size_bytes", "size", "action", "destination", "source_group",
+        "origins", "provenance", "pdf_kind", "vendor", "confidence", "reason",
+    ]
     with open(csv_out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader(); w.writerows(rows)
+        w.writeheader()
+        w.writerows(redacted_row(r) if ns.redact_report else r for r in rows)
 
-    counts = Counter(r["action"] for r in rows)
-    move_bytes = sum(int(r["size_bytes"]) for r in rows if r["action"] == "MOVE")
-    print("\nDOWNLOADS ORGANIZER")
-    print("=" * 78)
-    print(f"Root:            {root}")
-    print(f"Filter:          {ns.only}")
-    print(f"Move candidates: {counts['MOVE']} ({human_size(move_bytes)})")
-    print(f"Nested warnings: {counts['WARN_NESTED']}")
-    print(f"Left in place:   {counts['LEAVE']}")
-    print(f"Report:          {csv_out}\n")
+    print_summary(rows, root, ns.only, csv_out)
 
-    for r in rows:
-        if r["action"] == "MOVE":
+    if ns.verbose:
+        print("\nDetailed decisions:")
+        for r in rows:
             extra = ""
             if r["category"] == "pdf":
                 extra = f" [{r['pdf_kind']}/{r['vendor']}/{r['confidence']}]"
-            print(f"MOVE {r['size']:>10}  {r['path']} -> {r['destination']}{extra}")
-        elif r["action"] == "WARN_NESTED":
-            print(f"WARN nested: {r['path']} [{r['category']}, source={r['source_group']}]")
+            if r["action"] == "SENSITIVE":
+                print(f"SENSITIVE {r['size']:>10}  {r['path']} [{r['reason']}] - no move")
+            elif r["destination"]:
+                print(f"{r['action']:<9} {r['size']:>10}  {r['path']} -> {r['destination']}{extra}")
+            else:
+                print(f"{r['action']:<9} {r['size']:>10}  {r['path']}{extra}")
 
     if not ns.apply:
         print("\nDRY RUN ONLY. No files were moved.")
+        print("Use --verbose to show filenames. Nested folders are intentionally untouched.")
         return
 
     moves = [r for r in rows if r["action"] == "MOVE"]
+    if ns.include_review:
+        moves += [r for r in rows if r["action"] == "REVIEW"]
+
     if not ns.yes:
-        answer = input(f"\nMove {len(moves)} top-level files according to this plan? [yes/NO] ")
+        review_note = " including review staging" if ns.include_review else ""
+        answer = input(f"\nMove {len(moves)} top-level files{review_note}? [yes/NO] ")
         if answer != "yes":
             print("Aborted.")
             return
@@ -359,14 +511,14 @@ def main():
     moved = 0
     for r in moves:
         src = root / r["path"]
-        if not src.is_file():
-            print(f"SKIP missing: {src}")
+        if not src.is_file() or not r["destination"]:
             continue
         dst = collision_safe(root / r["destination"])
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
         moved += 1
-    print(f"\nMoved {moved} files. Nothing was deleted.")
+
+    print(f"\nMoved {moved} files. Sensitive candidates and nested folders were untouched. Nothing was deleted.")
 
 
 if __name__ == "__main__":

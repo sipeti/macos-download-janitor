@@ -43,6 +43,23 @@ def organizer_args(ns, only, allow_apply=True):
     return args
 
 
+def managed_pdf_args(ns, allow_apply=True):
+    args = []
+    if getattr(ns, "root", None):
+        args += ["--root", ns.root]
+    if getattr(ns, "verbose", False):
+        args.append("--verbose")
+    if getattr(ns, "redact_report", False):
+        args.append("--redact-report")
+    if allow_apply and getattr(ns, "apply", False):
+        args.append("--apply")
+    if allow_apply and getattr(ns, "include_review", False):
+        args.append("--include-review")
+    if allow_apply and getattr(ns, "yes", False):
+        args.append("--yes")
+    return args
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="janitor",
@@ -94,15 +111,20 @@ def main():
 
     p = sub.add_parser("pdf", help="PDF classification tools")
     psub = p.add_subparsers(dest="pdf_command", required=True)
-    paudit = psub.add_parser("audit", help="Classify top-level PDFs without moving")
+
+    paudit = psub.add_parser("audit", help="Classify PDFs without moving")
+    paudit.add_argument("--scope", choices=["inbox", "managed"], default="inbox", help="inbox=Downloads root; managed=recursive _PDF tree")
     add_common_display_args(paudit)
-    porg = psub.add_parser("organize", help="Move only high-confidence top-level PDFs")
+
+    porg = psub.add_parser("organize", help="Move/reclassify high-confidence PDFs")
+    porg.add_argument("--scope", choices=["inbox", "managed"], default="inbox", help="inbox=Downloads root; managed=recursive _PDF tree")
     porg.add_argument("--apply", action="store_true")
-    porg.add_argument("--include-review", action="store_true", help="Stage lower-confidence PDFs under _PDF/_Review")
+    porg.add_argument("--include-review", action="store_true", help="Also stage lower-confidence PDFs under _PDF/_Review")
     porg.add_argument("--yes", action="store_true")
     add_common_display_args(porg)
 
-    pvendors = psub.add_parser("vendors", help="Discover recurring vendor/company names in top-level PDFs")
+    pvendors = psub.add_parser("vendors", help="Discover recurring vendor/company names in PDFs")
+    pvendors.add_argument("--scope", choices=["inbox", "managed"], default="inbox", help="inbox=Downloads root; managed=recursive _PDF tree")
     pvendors.add_argument("--min-count", type=int, default=2, help="Minimum PDF count for recurring candidates")
     pvendors.add_argument("--verbose", action="store_true", help="Show matching filenames; private")
     pvendors.add_argument("--show-mentions", action="store_true", help="Also show recurring non-vendor company mentions")
@@ -111,6 +133,7 @@ def main():
     pvendors.add_argument("--no-pdfkit", action="store_true", help="Disable native macOS PDFKit fallback")
 
     plearn = psub.add_parser("learn", help="Promote discovered vendors into private local rules")
+    plearn.add_argument("--scope", choices=["inbox", "managed"], default="inbox", help="Learn from inbox or managed discovery report")
     plearn.add_argument("--include-medium", action="store_true", help="Also include medium-confidence candidates")
     plearn.add_argument("--apply", action="store_true", help="Write rules to private local config")
     plearn.add_argument("--yes", action="store_true", help="Skip confirmation with --apply")
@@ -168,7 +191,7 @@ def main():
 
     if ns.command == "pdf":
         if ns.pdf_command == "vendors":
-            args = [*root_args, "--min-count", str(ns.min_count)]
+            args = [*root_args, "--scope", ns.scope, "--min-count", str(ns.min_count)]
             if ns.verbose:
                 args.append("--verbose")
             if ns.show_mentions:
@@ -180,8 +203,9 @@ def main():
             if ns.no_pdfkit:
                 args.append("--no-pdfkit")
             run_script("pdf_vendor_discovery.py", args)
+
         if ns.pdf_command == "learn":
-            args = [*root_args]
+            args = [*root_args, "--scope", ns.scope]
             if ns.include_medium:
                 args.append("--include-medium")
             if ns.apply:
@@ -189,7 +213,11 @@ def main():
             if ns.yes:
                 args.append("--yes")
             run_script("pdf_vendor_promote.py", args)
-        run_script("downloads_organizer.py", organizer_args(ns, "pdf"))
+
+        if ns.pdf_command in {"audit", "organize"} and ns.scope == "managed":
+            run_script("pdf_managed_organizer.py", managed_pdf_args(ns, allow_apply=(ns.pdf_command == "organize")))
+
+        run_script("downloads_organizer.py", organizer_args(ns, "pdf", allow_apply=(ns.pdf_command == "organize")))
 
     if ns.command == "media":
         run_script("downloads_organizer.py", organizer_args(ns, "media"))
